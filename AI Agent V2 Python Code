@@ -1,0 +1,240 @@
+### PRUEBA INSERTANDO BRIEF Y QUE DEVUELVA UN EXCEL PARSEANDO EL JSON Y QUE TOME SOLO EL JSON DE LA RESPUESTA
+### Y QUE VALIDE QUE CUMPLA LIMITE DE CARACTERES. EN CASO QUE NO QUE LE PIDA A GROQ QUE LO REESCRIBA
+### Y EN CASO QUE PIDA QUE REESCRIBA, QUE LO HAGA CON TODOS LOS TEXTOS PASADOS PARA OPTIMIZAR TOKENS
+### Y QUE MANTENGA LOS COPIES DE SEM EN UNA MISMA SOLAPA Y LO ORDENE MEJOR
+### !!! Y AHORA AGREGANDO MULTIPLES PLATAFORMAS !!! V2 USANDO CHAT GPT PAGO PARA CODIGO
+### PRUEBA CONCRETA DE COPIES PARA EL CLASICO DE ECUADOR BARCELONA SC VS EMELEC Y25 W20 -- MEJORANDO PROMPT CON GPT PAGO
+### Y AHORA CON OUTPUT EN FORMATO DATABASE
+### Y AHORA TRADUCIENDO LOS COPIES AL INGLÉS Y PORTUGUÉS
+
+import os
+import json
+import pandas as pd
+from groq import Groq
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
+
+# Configurar cliente Groq (o reemplazar por OpenAI)
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# Estructura de campañas: claves, número de items y límite de caracteres
+CAMPAIGNS_STRUCTURE = {
+    "SEM": {
+        "headlines": (15, 30),
+        "long_headlines": (5, 90),
+        "short_description": (1, 60),
+        "long_descriptions": (4, 90)
+    },
+    "MetaDemandGen": {
+        "primary_texts": (4, 250),
+        "headlines": (3, 30),
+        "descriptions": (3, 30)
+    },
+    "MetaDemandCapture": {
+        "primary_texts": (4, 250),
+        "headlines": (3, 30),
+        "descriptions": (3, 30)
+    },
+    "GoogleDemandGen": {
+        "headlines": (5, 30),
+        "short_description": (1, 60),
+        "long_descriptions": (4, 90)
+    }
+}
+
+# 1. Extraer JSON de la respuesta bruta del modelo
+def limpiar_json(response_text: str) -> dict:
+    start = response_text.find('{')
+    end = response_text.rfind('}') + 1
+    raw = response_text[start:end]
+    # Permitir caracteres de control dentro de las cadenas
+    return json.loads(raw, strict=False)
+
+# 2. Validar, reescribir y traducir textos que excedan el límite, en batch
+def preparar_batch(texts: list, limit: int, tipo: str) -> list:
+    df = pd.DataFrame({"Original": texts, "Reescrito": texts.copy()})
+    over_limit = df[df["Original"].str.len() > limit].index.tolist()
+    if over_limit:
+        bloques = "\n".join([
+            f'Texto {i+1}: "{df.at[i, "Original"]}"' for i in over_limit
+        ])
+        prompt = f"""
+Eres un redactor publicitario experto.
+Reescribe los siguientes textos para que no superen {limit} caracteres cada uno.
+Mantén el sentido original y estilo.
+Devuelve sólo los textos reescritos, uno por línea, sin numeración ni comillas.
+
+{bloques}
+""".strip()
+        resp = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3
+        )
+        lines = [l.strip() for l in resp.choices[0].message.content.splitlines() if l.strip()]
+        for idx, new_text in zip(over_limit, lines):
+            clean = new_text if len(new_text) <= limit else new_text[:limit].rstrip() + '...'
+            df.at[idx, "Reescrito"] = clean
+    return df["Reescrito"].tolist()
+
+def traducir_batch(texts: list, target: str) -> list:
+    """
+    Traduce cada texto en `texts` al idioma `target`:
+      - 'en' para inglés (US)
+      - 'pt' para portugués (BR)
+      Devolviendo la lista de traducciones en el mismo orden.
+    """
+    if target not in ("en", "pt"):
+        return texts
+
+    # Construyo un prompt único que pida todas las traducciones
+    bloques = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+    lenguaje = "English (US)" if target == "en" else "Português (Brasil)"
+    prompt = f"""
+Eres un traductor experto. Traduce los siguientes textos al {lenguaje}, preservando el sentido y adaptando términos:
+{bloques}
+Devuelve sólo las traducciones, una por línea, en el mismo orden, sin numeración.
+""".strip()
+
+    resp = client.chat.completions.create(
+        messages=[
+            {"role": "system",  "content": "You are a helpful assistant."},
+            {"role": "user",    "content": prompt}
+        ],
+        model="llama-3.3-70b-versatile",
+        temperature=0
+    )
+    lines = [l.strip() for l in resp.choices[0].message.content.splitlines() if l.strip()]
+    # En caso de que falle alguna línea, devuelvo el original
+    return [lines[i] if i < len(lines) else texts[i] for i in range(len(texts))]
+
+
+# 3. Generar el prompt para múltiples campañas con instrucciones mejoradas
+def generar_prompt_multi(briefs: dict) -> str:
+    # Plantilla JSON vacía
+    template = {}
+    for camp, fields in CAMPAIGNS_STRUCTURE.items():
+        template[camp] = {}
+        for field, (count, _) in fields.items():
+            template[camp][field] = [] if count > 1 else ""
+
+    instrucciones = [
+        "Regla global: acerca cada texto al 95-100 % de su límite de caracteres; si queda corto, expándelo con adjetivos sensoriales, beneficios concretos, verbos de acción, micro-historias o datos gancho hasta cumplirlo.",
+        "SEM: genera exactamente 15 headlines (máx 30 car.), 5 long_headlines (máx 90 car.), 1 short_description (máx 60 car.) y 4 long_descriptions (máx 90 car.); tono claro, metáforas breves, CTAs persuasivos y reescribe lo que no alcance el 95 %.",
+        "MetaDemandGen: genera exactamente 4 primary_texts bien variados (máx 250 car.) usando variedad de emojis (evitar repetirlos), bullets • (usar enters para los bullets), variación de mayúsculas/minúsculas, preguntas gancho y CTAs suaves; cada texto entre 95-100 %.",
+        "MetaDemandCapture: genera exactamente 4 primary_texts bien variados (máx 250 car.) con variedad de emojis (evitar repetirlos), bullets • (usar enters para los bullets), MAYÚSCULAS estratégicas y CTAs directos como «¡Suscríbete ahora!» o «Contrata ahora»; cada texto entre 95-100 %.",
+        "MetaDemandGen y MetaDemandCapture: para cada conjunto crea 3 headlines (máx 30 car.) y 3 descriptions (máx 30 car.) sin emojis; estilo Gen = curiosidad, Capture = acción; siempre 95-100 % del límite.",
+        "GoogleDemandGen: genera 5 headlines (máx 30 car.), 1 short_description (máx 60 car.) y 4 long_descriptions (máx 90 car.) reciclando y adaptando SEM; todos entre 95-100 %.",
+        "Verificación automática: antes de responder, corrige cualquier línea que no cumpla longitud, exceda el límite o sea redundante; itera hasta que TODA la salida satisfaga las reglas y entrega las secciones tituladas (SEM, Meta Demand Gen, etc.) sin explicaciones extra."
+    ]
+
+    prompt = (
+        f"Eres un generador de copies experto para campañas pagas. Usa la información y sigue estas instrucciones detalladas:\n\n"
+        f"Empresa: {briefs['company']}\n"
+        f"Contexto: {briefs['company_context']}\n"
+        f"Nombre de campaña: {briefs['campaign_name']}\n"
+        f"Brief: {briefs['campaign_brief']}\n"
+        f"Comentarios: {briefs['extras']}\n\n"
+        f"Instrucciones:\n" + "\n".join(f"- {ins}" for ins in instrucciones) + "\n\n"
+        f"Devuelve SOLO un JSON con esta plantilla (sin texto adicional) y llena cada campo con los textos solicitados:\n"
+        f"{json.dumps(template, indent=2, ensure_ascii=False)}"
+    )
+    return prompt
+
+# 4. Generar Excel con hoja por campaña y formato de reescritos/truncados
+
+def generar_excel_multi(data: dict,
+                        filename: str = "copies_clasico-ecuador_y25_w20_v5.xlsx"):
+    # Mapear campañas a plataforma y tipo
+    platform_map = {
+        "SEM": "Google",
+        "GoogleDemandGen": "Google",
+        "MetaDemandGen": "Meta",
+        "MetaDemandCapture": "Meta"
+    }
+    tipo_map = {
+        "SEM": "SEM",
+        "GoogleDemandGen": "DemandGen",
+        "MetaDemandGen": "DemandGen",
+        "MetaDemandCapture": "DemandCapture"
+    }
+
+    rows = []
+    for camp, fields in CAMPAIGNS_STRUCTURE.items():
+        platform = platform_map.get(camp, "")
+        tipo     = tipo_map.get(camp, camp)
+        camp_data = data.get(camp, {})
+
+        for field, (count, limit) in fields.items():
+            # Original en español
+            orig_texts = camp_data.get(field, [])
+            if not isinstance(orig_texts, list):
+                orig_texts = [orig_texts]
+            cleaned_es = preparar_batch(orig_texts, limit, f"{camp}.{field}")
+            # Traducciones
+            cleaned_en = traducir_batch(cleaned_es, "en")
+            cleaned_pt = traducir_batch(cleaned_es, "pt")
+
+            # Asegurar longitud uniforme
+            for lst in (cleaned_es, cleaned_en, cleaned_pt):
+                while len(lst) < count:
+                    lst.append("")
+
+            # Agregar filas para cada idioma
+            for i in range(count):
+                title = f"{field.replace('_',' ').title()} {i+1}"
+                for idioma, textos in (("es", cleaned_es),
+                                       ("en", cleaned_en),
+                                       ("pt", cleaned_pt)):
+                    rows.append({
+                        "Platform": platform,
+                        "Tipo": tipo,
+                        "Campo": field,
+                        "Título": title,
+                        "Idioma": idioma,
+                        "Texto": textos[i]
+                    })
+
+    df = pd.DataFrame(rows, columns=["Platform","Tipo","Campo","Título","Idioma","Texto"])
+
+    # Escribir todo en una sola hoja
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="Copies", index=False)
+
+    # Formatear truncados
+    wb = load_workbook(filename)
+    ws = wb["Copies"]
+    for row in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row, column=6)
+        if isinstance(cell.value, str) and cell.value.endswith("..."):
+            for col in range(1, 7):
+                c = ws.cell(row=row, column=col)
+                c.font = Font(color="9C0006")
+                c.fill = PatternFill(start_color="FFC7CE",
+                                     end_color="FFC7CE",
+                                     fill_type="solid")
+    wb.save(filename)
+    print(f"✅ Excel generado con traducciones: {filename}")
+
+
+# 5. Ejecución principal
+
+if __name__ == "__main__":
+    briefs_config = {
+        'company': os.getenv('COMPANY_NAME', 'Fanatiz'),
+        'company_context': os.getenv('COMPANY_CONTEXT', 'Empresa pionera en transmitir fútbol de sudamerica y el mundo fuera de sudamerica, principalmente en Estados Unidos, España y Canadá, con sus contenidos principales como la Liga Argentina, la Liga1 de Perú, la Primera División de Paraguay, la Liga BetPlay de Colombia, la Primera División de Uruguay, Copa Libertadores y Sudamericana, La LigaPro de Ecuador, la Primeira Liga de Portugal, la Ligue 1 de Francia, la SuperLig de Turquia, la CAF Champions League, el Premier Padel Tour y mucho más. Fanatiz transmite el fútbol de manera 100% legal y seguro, ofreciendo el contenido en alta calidad, con el idioma de preferencia (Español, Inglés o Portugués) o con la opción de seleccionar el sonido del estadio para vivir los partidos como si estuvieras allí. Pueden usar la app desde nuestro navegador web, descargarla en celular Android o Apple Store con la posibilidad de castear a la TV o si tienen Smart TV, Android TV, Apple TV, Roku, FireTV, Samsung, LG o TV Boxes pueden descargar la aplicación directamente en su TV y disfrutar el fútbol en la pantalla grande (se recomienda usar el navegador de la TV)'),
+        'campaign_name': os.getenv('CAMPAIGN_NAME', 'Clásico de Ecuador: Barcelona SC vs Emelec'),
+        'campaign_brief': os.getenv('CAMPAIGN_BRIEF', 'Campaña promocionando el Clásico de Ecuador entre Barcelona SC vs Emelec el domingo 18 de mayo a las 3:00 pm ET | 6:00 pm PT a través del Plan Mensual LigaPro Ecuador de Fanatiz por $14.99'),
+        'extras': os.getenv('CAMPAIGN_EXTRAS', 'Enfocar en descarga de CTV App')
+    }
+    prompt = generar_prompt_multi(briefs_config)
+    resp = client.chat.completions.create(
+        messages=[{'role': 'system', 'content': 'You are a helpful assistant.'}, {'role': 'user', 'content': prompt}],
+        model="llama-3.3-70b-versatile",
+        temperature=0.3
+    )
+    data = limpiar_json(resp.choices[0].message.content)
+    generar_excel_multi(data)
